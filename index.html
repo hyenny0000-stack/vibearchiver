@@ -1,0 +1,678 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>VibeArchiver</title>
+<script src="https://cdn.tailwindcss.com/3.4.17"></script>
+<script src="https://cdn.jsdelivr.net/npm/preact@10.19.3/dist/preact.umd.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/preact@10.19.3/hooks/dist/hooks.umd.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/htm@3.1.1/dist/htm.js"></script>
+<style>
+  :root { color-scheme: light; }
+  html, body, #root { height: 100%; margin: 0; }
+  body { background: #f5f5f7; overscroll-behavior: none; -webkit-tap-highlight-color: transparent; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+const { h, render } = preact;
+const { useState, useEffect, useRef, useReducer, useMemo, useCallback } = preactHooks;
+const html = htm.bind(h);
+
+const uid = () => Math.random().toString(36).slice(2, 9);
+const CID = uid();
+const CARD_W = 220, CARD_H = 112;
+const DEF_CAM = { x: 0, y: 0, k: 1 };
+const clamp = (k) => Math.min(2.5, Math.max(0.25, k));
+const COLORS = ["#1d1d1f", "#0071e3", "#30a46c", "#ff9f0a", "#af52de", "#ff375f"];
+const dims = (n) => (n.img ? { w: n.w, h: n.w * n.r } : n.mapRef ? { w: 168, h: 60 } : { w: CARD_W, h: CARD_H });
+const cardInfo = (state, n) => {
+  if (n.img) return { img: n.img };
+  if (n.mapRef) {
+    const t = state.maps.find((x) => x.id === n.mapRef); if (!t) return null;
+    return { title: t.name, body: "", dark: true, compact: true, color: t.color || COLORS[0] };
+  }
+  const m = state.memos.find((y) => y.id === n.memoId);
+  return m ? { title: m.title || "제목 없음", body: m.body, tags: m.tags } : null;
+};
+const matchCI = (ci, q) => !!ci && !ci.img && [ci.title, ci.body, ...(ci.tags || [])].join(" ").toLowerCase().includes(q);
+const shrink = (file, max, q) => new Promise((res, rej) => {
+  const url = URL.createObjectURL(file), im = new Image();
+  im.onload = () => {
+    const k = Math.min(1, max / Math.max(im.naturalWidth, im.naturalHeight)), w = Math.round(im.naturalWidth * k), h = Math.round(im.naturalHeight * k);
+    const cv = document.createElement("canvas"); cv.width = w; cv.height = h;
+    const cx = cv.getContext("2d"); cx.fillStyle = "#fff"; cx.fillRect(0, 0, w, h); cx.drawImage(im, 0, 0, w, h);
+    URL.revokeObjectURL(url);
+    cv.toBlob((b) => (b ? res({ blob: b, r: h / w }) : rej()), "image/jpeg", q);
+  };
+  im.onerror = rej; im.src = url;
+});
+const KEY = "vibearchiver:v1";
+const lsLoad = () => { try { return JSON.parse(localStorage.getItem(KEY) || "null"); } catch { return null; } };
+const lsSave = (d) => { try { localStorage.setItem(KEY, JSON.stringify(d)); } catch {} };
+
+/* ---------- icons (lucide 스타일 경로) ---------- */
+const P = {
+  plus: ["M5 12h14", "M12 5v14"], pen: ["M12 20h9", "M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"],
+  move: ["M4 4l7.07 17 2.51-7.39L21 11.07z"],
+  link: ["M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71", "M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"],
+  erase: ["m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21", "M22 21H7", "m5 11 9 9"],
+  down: ["M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4", "M7 10l5 5 5-5", "M12 15V3"],
+  up: ["M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4", "M17 8l-5-5-5 5", "M12 3v12"],
+  x: ["M18 6 6 18", "M6 6l12 12"], trash: ["M3 6h18", "M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6", "M10 11v6M14 11v6"],
+  search: ["M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16z", "m21 21-4.3-4.3"],
+  back: ["m15 18-6-6 6-6"], image: ["M19 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2z", "M8.5 10a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3z", "m21 15-5-5L5 21"],
+};
+const Ico = (k, s = 17) => html`<svg width=${s} height=${s} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${P[k].map((d) => html`<path d=${d} />`)}</svg>`;
+
+/* ---------- 초기 데이터 ---------- */
+function seed() {
+  const a = { id: uid(), title: "탐구 질문: 도시 열섬은 학교 주변에서도 나타날까?", body: "교내 3곳과 인근 공원의 기온을 한 주간 측정해 비교한다.\n- 측정 도구: 온습도 로거\n- 변수: 그늘 면적, 포장 재질", tags: ["탐구", "지구과학"], updated: Date.now() };
+  const b = { id: uid(), title: "수학 오답 노트 루틴", body: "틀린 문제를 유형별로 분류하고, 3일 뒤 다시 풀어본다.", tags: ["학습법", "수학"], updated: Date.now() };
+  const c = { id: uid(), title: "스토리라인: 환경 → 데이터 → 정책 제안", body: "관심 계기에서 시작해 측정과 분석을 거쳐 지역 제안으로 확장되는 흐름.", tags: ["생기부", "스토리라인"], updated: Date.now() };
+  const n1 = { id: uid(), memoId: c.id, x: 60, y: 80 }, n2 = { id: uid(), memoId: a.id, x: 380, y: 60 }, n3 = { id: uid(), memoId: b.id, x: 240, y: 260 };
+  return { memos: [a, b, c], maps: [
+    { id: uid(), name: "생기부 스토리라인", nodes: [n1, n2], strokes: [], links: [{ id: uid(), from: n1.id, to: n2.id }] },
+    { id: uid(), name: "과목별 탐구", nodes: [n2, n3].map((n) => ({ ...n, id: uid() })), strokes: [], links: [] },
+  ] };
+}
+
+/* ---------- Reducer ---------- */
+function baseReducer(s, a) {
+  const upMap = (id, fn) => ({ ...s, maps: s.maps.map((m) => (m.id === id ? fn(m) : m)) });
+  const unplace = (m, memoId) => { const gone = m.nodes.filter((n) => n.memoId === memoId).map((n) => n.id); return { ...m, nodes: m.nodes.filter((n) => !gone.includes(n.id)), links: m.links.filter((l) => !gone.includes(l.from) && !gone.includes(l.to)) }; };
+  switch (a.type) {
+    case "load": return a.data;
+    case "merge": { const have = new Set(s.memos.map((m) => m.id)); return { ...s, memos: [...s.memos, ...a.memos.filter((m) => !have.has(m.id))], maps: [...s.maps, ...a.maps.filter((m) => !m.home).map((m) => ({ ...m, id: uid() }))] }; }
+    case "addMemo": return { ...s, memos: [...s.memos, a.memo], maps: s.maps.map((m) => m.id === a.mapId ? { ...m, nodes: [...m.nodes, { id: uid(), memoId: a.memo.id, x: a.x, y: a.y }] } : m) };
+    case "updateMemo": return { ...s, memos: s.memos.map((m) => (m.id === a.id ? { ...m, ...a.patch, updated: Date.now() } : m)) };
+    case "deleteMemo": return { ...s, memos: s.memos.filter((m) => m.id !== a.id), maps: s.maps.map((m) => unplace(m, a.id)) };
+    case "place": return upMap(a.mapId, (m) => m.nodes.some((n) => n.memoId === a.memoId) ? m : { ...m, nodes: [...m.nodes, { id: uid(), memoId: a.memoId, x: a.x, y: a.y }] });
+    case "unplace": return upMap(a.mapId, (m) => unplace(m, a.memoId));
+    case "moveNode": return upMap(a.mapId, (m) => ({ ...m, nodes: m.nodes.map((n) => (n.id === a.id ? { ...n, x: a.x, y: a.y } : n)) }));
+    case "addImage": return upMap(a.mapId, (m) => ({ ...m, nodes: [...m.nodes, { id: uid(), img: a.img, w: a.w, r: a.r, x: a.x, y: a.y }] }));
+    case "removeNode": return upMap(a.mapId, (m) => ({ ...m, nodes: m.nodes.filter((n) => n.id !== a.id), links: m.links.filter((l) => l.from !== a.id && l.to !== a.id) }));
+    case "resizeNode": return upMap(a.mapId, (m) => ({ ...m, nodes: m.nodes.map((n) => (n.id === a.id ? { ...n, w: a.w } : n)) }));
+    case "setColor": return upMap(a.id, (m) => ({ ...m, color: a.color }));
+    case "delMap": return { ...s, maps: s.maps.filter((m) => m.id !== a.id) };
+    case "addStroke": return upMap(a.mapId, (m) => ({ ...m, strokes: [...m.strokes, { id: uid(), pts: a.pts }] }));
+    case "delStroke": return upMap(a.mapId, (m) => ({ ...m, strokes: m.strokes.filter((x) => x.id !== a.id) }));
+    case "addLink": return upMap(a.mapId, (m) => m.links.some((l) => (l.from === a.from && l.to === a.to) || (l.from === a.to && l.to === a.from)) ? m : { ...m, links: [...m.links, { id: uid(), from: a.from, to: a.to }] });
+    case "delLink": return upMap(a.mapId, (m) => ({ ...m, links: m.links.filter((l) => l.id !== a.id) }));
+    case "addMap": return { ...s, maps: [...s.maps, { id: a.id, name: a.name, nodes: [], strokes: [], links: [] }] };
+    case "renameMap": return upMap(a.id, (m) => ({ ...m, name: a.name }));
+    default: return s;
+  }
+}
+/* 홈 맵: 모든 맵을 카드처럼 보여 주고 서로 연결/이동하는 첫 화면 (없으면 자동 생성, 새 맵은 자동 추가) */
+function migrate(s) {
+  if (!s || !s.maps) return s;
+  const real = s.maps.filter((m) => !m.home);
+  const old = s.maps.find((m) => m.home);
+  const home = old || { id: "home", name: "홈", home: true, nodes: [], strokes: [], links: [] };
+  const have = new Set(home.nodes.map((n) => n.mapRef));
+  const missing = real.filter((m) => !have.has(m.id));
+  const stale = home.nodes.filter((n) => n.mapRef && !real.some((m) => m.id === n.mapRef));
+  if (old && old.cleared && !missing.length && !stale.length) return s;
+  const base = home.nodes.length - stale.length;
+  const fresh = missing.map((m, i) => ({ id: uid(), mapRef: m.id, x: 80 + ((base + i) % 4) * 260, y: 110 + Math.floor((base + i) / 4) * 170 }));
+  const nodes = [...home.nodes.filter((n) => !stale.includes(n)), ...fresh];
+  const links = old && old.cleared ? home.links.filter((l) => nodes.some((n) => n.id === l.from) && nodes.some((n) => n.id === l.to)) : [];
+  return { ...s, maps: [{ ...home, nodes, links, cleared: true }, ...real] };
+}
+const reducer = (s, a) => migrate(baseReducer(s, a));
+const pathD = (pts) => pts.map((p, i) => `${i ? "L" : "M"}${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(" ");
+
+/* ======================== 무한 캔버스 ======================== */
+function Canvas({ state, dispatch, map, tool, cam, setCam, openMemo, openMap, query, askDelete, editMap }) {
+  const ref = useRef(null), pts = useRef(new Map()), drag = useRef(null), cardDrag = useRef(null), rs = useRef(null), lp = useRef(null);
+  const [draft, setDraft] = useState(null);
+  const [linkFrom, setLinkFrom] = useState(null);
+  const memoOf = (id) => state.memos.find((m) => m.id === id);
+  const nodeOf = (id) => map.nodes.find((n) => n.id === id);
+  useEffect(() => setLinkFrom(null), [tool, map.id]);
+  useEffect(() => {
+    const el = ref.current;
+    const hd = (e) => {
+      e.preventDefault();
+      const r = el.getBoundingClientRect(), cx = e.clientX - r.left, cy = e.clientY - r.top;
+      setCam((c) => { const k = clamp(c.k * Math.exp(-e.deltaY * 0.0015)); const wx = (cx - c.x) / c.k, wy = (cy - c.y) / c.k; return { k, x: cx - wx * k, y: cy - wy * k }; });
+    };
+    el.addEventListener("wheel", hd, { passive: false });
+    return () => el.removeEventListener("wheel", hd);
+  }, [setCam]);
+  const toWorld = (e) => { const r = ref.current.getBoundingClientRect(); return { x: (e.clientX - r.left - cam.x) / cam.k, y: (e.clientY - r.top - cam.y) / cam.k }; };
+
+  const onDown = (e) => {
+    e.currentTarget.setPointerCapture(e.pointerId);
+    pts.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pts.current.size === 2) {
+      setDraft(null);
+      const [a, b] = [...pts.current.values()];
+      drag.current = { type: "pinch", d: Math.hypot(a.x - b.x, a.y - b.y), cam };
+    } else if (tool === "pen") setDraft([toWorld(e)]);
+    else drag.current = { type: "pan", sx: e.clientX, sy: e.clientY, cam };
+  };
+  const onMove = (e) => {
+    if (!pts.current.has(e.pointerId)) return;
+    pts.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    const d = drag.current;
+    if (d && d.type === "pinch" && pts.current.size === 2) {
+      const [a, b] = [...pts.current.values()], r = ref.current.getBoundingClientRect();
+      const k = clamp((d.cam.k * Math.hypot(a.x - b.x, a.y - b.y)) / d.d);
+      const cx = (a.x + b.x) / 2 - r.left, cy = (a.y + b.y) / 2 - r.top;
+      const wx = (cx - d.cam.x) / d.cam.k, wy = (cy - d.cam.y) / d.cam.k;
+      setCam(() => ({ k, x: cx - wx * k, y: cy - wy * k }));
+    } else if (draft) setDraft((p) => [...p, toWorld(e)]);
+    else if (d && d.type === "pan") setCam(() => ({ ...d.cam, x: d.cam.x + e.clientX - d.sx, y: d.cam.y + e.clientY - d.sy }));
+  };
+  const onUp = (e) => {
+    pts.current.delete(e.pointerId);
+    if (draft && draft.length > 1) dispatch({ type: "addStroke", mapId: map.id, pts: draft });
+    setDraft(null);
+    if (pts.current.size === 0) drag.current = null;
+  };
+  const cardDown = (e, n) => {
+    if (tool === "pen") return;
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    cardDrag.current = { id: n.id, sx: e.clientX, sy: e.clientY, ox: n.x, oy: n.y, moved: false };
+    if (tool === "move" && n.mapRef) lp.current = setTimeout(() => { const c = cardDrag.current; if (c && !c.moved) { c.long = true; editMap(n.mapRef); } }, 500);
+  };
+  const cardMove = (e) => {
+    const d = cardDrag.current;
+    if (!d || tool !== "move") return;
+    const dx = e.clientX - d.sx, dy = e.clientY - d.sy;
+    if (Math.hypot(dx, dy) > 4) { d.moved = true; clearTimeout(lp.current); }
+    if (d.moved) dispatch({ type: "moveNode", mapId: map.id, id: d.id, x: d.ox + dx / cam.k, y: d.oy + dy / cam.k });
+  };
+  const cardUp = (n) => {
+    clearTimeout(lp.current); const d = cardDrag.current; cardDrag.current = null;
+    if (!d || d.moved || d.long) return;
+    if (tool === "move") { if (n.mapRef) openMap(n.mapRef); else if (!n.img) openMemo(n.memoId); }
+    if (tool === "erase" && n.img) dispatch({ type: "removeNode", mapId: map.id, id: n.id });
+    if (tool === "erase" && n.mapRef) askDelete(n.mapRef);
+    if (tool === "link") {
+      if (!linkFrom) setLinkFrom(n.id);
+      else { if (linkFrom !== n.id) dispatch({ type: "addLink", mapId: map.id, from: linkFrom, to: n.id }); setLinkFrom(null); }
+    }
+  };
+  const resizeDown = (e, n) => { e.stopPropagation(); e.currentTarget.setPointerCapture(e.pointerId); rs.current = { id: n.id, sx: e.clientX, w: n.w }; };
+  const resizeMove = (e) => { const d = rs.current; if (d) dispatch({ type: "resizeNode", mapId: map.id, id: d.id, w: Math.max(80, Math.min(1200, d.w + (e.clientX - d.sx) / cam.k)) }); };
+  const resizeUp = () => { rs.current = null; };
+  const center = (n) => { const d = dims(n); return { x: n.x + d.w / 2, y: n.y + d.h / 2 }; };
+  const erase = tool === "erase";
+  const cursor = tool === "pen" ? "crosshair" : tool === "move" ? "grab" : "default";
+  const hit = erase ? "stroke" : "none";
+
+  return html`
+  <div ref=${ref} class="absolute inset-0 overflow-hidden touch-none select-none"
+    style=${`cursor:${cursor};background-image:radial-gradient(#c9c9ce 1px,transparent 1px);background-size:${24 * cam.k}px ${24 * cam.k}px;background-position:${cam.x}px ${cam.y}px`}
+    onPointerDown=${onDown} onPointerMove=${onMove} onPointerUp=${onUp} onPointerCancel=${onUp}>
+    <div class="absolute left-0 top-0" style=${`transform:translate(${cam.x}px,${cam.y}px) scale(${cam.k});transform-origin:0 0`}>
+      <svg class="absolute left-0 top-0 overflow-visible" width="1" height="1" style="pointer-events:none">
+        <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#86868b" /></marker></defs>
+        ${map.links.map((l) => {
+          const f = nodeOf(l.from), t = nodeOf(l.to); if (!f || !t) return null;
+          const a = center(f), b = center(t), df = dims(f), dt = dims(t), dx = b.x - a.x, dy = b.y - a.y;
+          const ks = Math.min(df.w / 2 / (Math.abs(dx) || 1e-6), df.h / 2 / (Math.abs(dy) || 1e-6)), ke = Math.min(dt.w / 2 / (Math.abs(dx) || 1e-6), dt.h / 2 / (Math.abs(dy) || 1e-6));
+          const ov = ks + ke >= 1, p1 = ov ? a : { x: a.x + dx * ks, y: a.y + dy * ks }, q1 = ov ? b : { x: b.x - dx * ke, y: b.y - dy * ke };
+          return html`<g key=${l.id} style=${`pointer-events:${hit};cursor:pointer`} onPointerDown=${(e) => { if (erase) { e.stopPropagation(); dispatch({ type: "delLink", mapId: map.id, id: l.id }); } }}>
+            <line x1=${p1.x} y1=${p1.y} x2=${q1.x} y2=${q1.y} stroke="transparent" stroke-width="22" />
+            <line x1=${p1.x} y1=${p1.y} x2=${q1.x} y2=${q1.y} stroke="#86868b" stroke-width="1.5" marker-end="url(#arr)" />
+          </g>`;
+        })}
+      </svg>
+      ${map.nodes.map((n) => {
+        const ci = cardInfo(state, n); if (!ci) return null;
+        const q = (query || "").trim().toLowerCase(), hit = q && matchCI(ci, q);
+        const d = dims(n), shadow = `${linkFrom === n.id ? "0 0 0 3px #0071e3," : hit ? "0 0 0 3px #ff9f0a," : ""}0 1px 2px rgba(0,0,0,.06),0 4px 16px rgba(0,0,0,.06)`;
+        return html`<div key=${n.id} onPointerDown=${(e) => cardDown(e, n)} onPointerMove=${cardMove} onPointerUp=${() => cardUp(n)}
+          class=${`absolute rounded-2xl overflow-hidden ${ci.img ? "" : ci.compact ? "flex items-center justify-center px-3 text-center" : "bg-white p-3.5"}`}
+          style=${`left:${n.x}px;top:${n.y}px;width:${d.w}px;height:${d.h}px;cursor:${tool === "move" ? "grab" : "pointer"};box-shadow:${shadow};opacity:${q && !hit ? 0.25 : 1}${ci.compact ? ";background:" + ci.color : ""}`}>
+          ${ci.img ? html`<img src=${ci.img} draggable="false" class="h-full w-full object-cover pointer-events-none" />` : html`<div class=${`${ci.compact ? "text-[14px]" : "text-[13px]"} font-semibold leading-snug line-clamp-2 ${ci.dark ? "text-white" : "text-[#1d1d1f]"}`}>${ci.title}</div>`}
+          ${!ci.img && !ci.compact && html`<div class=${`mt-1 text-[12px] leading-[1.45] line-clamp-3 whitespace-pre-line ${ci.dark ? "text-[#a1a1a6]" : "text-[#6e6e73]"}`}>${ci.body}</div>`}
+          ${ci.img && tool === "move" && html`<div onPointerDown=${(e) => resizeDown(e, n)} onPointerMove=${resizeMove} onPointerUp=${resizeUp} class="absolute bottom-0 right-0 h-7 w-7" style="cursor:nwse-resize;background:linear-gradient(135deg,transparent 50%,rgba(255,255,255,.9) 50%)"></div>`}
+        </div>`;
+      })}
+      <svg class="absolute left-0 top-0 overflow-visible" width="1" height="1" style="pointer-events:none">
+        ${map.strokes.map((s) => html`<g key=${s.id} style=${`pointer-events:${hit};cursor:pointer`} onPointerDown=${(e) => { if (erase) { e.stopPropagation(); dispatch({ type: "delStroke", mapId: map.id, id: s.id }); } }}>
+          <path d=${pathD(s.pts)} fill="none" stroke="transparent" stroke-width="18" />
+          <path d=${pathD(s.pts)} fill="none" stroke="#1d1d1f" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" />
+        </g>`)}
+        ${draft && html`<path d=${pathD(draft)} fill="none" stroke="#0071e3" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" />`}
+      </svg>
+    </div>
+    ${map.nodes.length === 0 && html`<div class="absolute inset-0 flex items-center justify-center text-sm text-[#86868b] pointer-events-none">아래 + 버튼으로 첫 카드를 만들어 보세요.</div>`}
+  </div>`;
+}
+
+/* ======================== 목록 & 검색 ======================== */
+const hl = (text, q) => {
+  const s = String(text); if (!q) return s;
+  const low = s.toLowerCase(), out = []; let from = 0, i;
+  while ((i = low.indexOf(q, from)) >= 0) { out.push(s.slice(from, i), html`<mark style="background:#ffe58f;border-radius:3px">${s.slice(i, i + q.length)}</mark>`); from = i + q.length; }
+  out.push(s.slice(from)); return out;
+};
+function ListView({ state, query, setQuery, tag, setTag, openMemo, mapId, addToCurrent }) {
+  const [group, setGroup] = useState(false);
+  const counts = useMemo(() => { const c = {}; state.memos.forEach((m) => m.tags.forEach((t) => { c[t] = (c[t] || 0) + 1; })); return c; }, [state.memos]);
+  const tags = Object.keys(counts).sort();
+  const q = query.trim().toLowerCase();
+  const rows = state.memos.filter((m) => (!tag || m.tags.includes(tag)) && (!q || [m.title, m.body, ...m.tags].join(" ").toLowerCase().includes(q))).sort((a, b) => b.updated - a.updated);
+  const mapsOf = (id) => state.maps.filter((mp) => mp.nodes.some((n) => n.memoId === id));
+  const row = (m, i, k) => {
+    const inMaps = mapsOf(m.id);
+    return html`<div key=${k} onClick=${() => openMemo(m.id)} class=${`cursor-pointer px-4 py-3 active:bg-[#f5f5f7] ${i ? "border-t border-[#f0f0f2]" : ""}`}>
+      <div class="text-[15px] font-medium text-[#1d1d1f]">${hl(m.title || "제목 없음", q)}</div>
+      <div class="mt-0.5 text-[13px] text-[#6e6e73] line-clamp-2 whitespace-pre-line">${hl(m.body, q)}</div>
+      <div class="mt-2 flex flex-wrap items-center gap-1.5 text-[11px]">
+        ${m.tags.map((t) => html`<span class="rounded-full bg-[#f5f5f7] px-2 py-0.5 text-[#515154]">${hl(t, q)}</span>`)}
+        ${inMaps.map((mp) => html`<span class="text-[#0071e3]">${mp.name}</span>`)}
+        ${!inMaps.some((mp) => mp.id === mapId) && html`<button onClick=${(e) => { e.stopPropagation(); addToCurrent(m.id); }} class="ml-auto text-[#0071e3]">현재 맵에 추가</button>`}
+      </div>
+    </div>`;
+  };
+  const sections = group ? [
+    ...tags.filter((t) => !tag || t === tag).map((t) => [`#${t}`, rows.filter((m) => m.tags.includes(t))]),
+    ...(tag ? [] : [["태그 없음", rows.filter((m) => !m.tags.length)]]),
+  ].filter(([, r]) => r.length) : null;
+  const empty = html`<div class="p-8 text-center text-sm text-[#86868b]">일치하는 카드가 없습니다. 검색어나 태그를 바꿔 보세요.</div>`;
+  return html`
+  <div class="absolute inset-0 overflow-y-auto pb-28" style="padding-top:calc(env(safe-area-inset-top,0px) + 4.5rem)">
+    <div class="mx-auto max-w-2xl px-4">
+      <div class="relative">
+        <span class="absolute left-3.5 top-1/2 -translate-y-1/2 text-[#86868b]">${Ico("search", 16)}</span>
+        <input value=${query} onInput=${(e) => setQuery(e.target.value)} placeholder="단어로 검색 (제목, 내용, 태그)"
+          class="w-full rounded-xl bg-[#e8e8ed] py-2.5 pl-10 pr-10 text-[15px] outline-none focus:bg-white focus:ring-2 focus:ring-[#0071e3]/40" />
+        ${query && html`<button onClick=${() => setQuery("")} class="absolute right-2.5 top-1/2 -translate-y-1/2 rounded-full p-1 text-[#86868b]" aria-label="검색어 지우기">${Ico("x", 14)}</button>`}
+      </div>
+      <div class="mt-3 flex flex-wrap items-center gap-1.5">
+        ${tags.map((t) => html`<button key=${t} onClick=${() => setTag(tag === t ? "" : t)} class=${`rounded-full px-3 py-1 text-xs ${tag === t ? "bg-[#1d1d1f] text-white" : "bg-white text-[#515154]"}`}>${t} <span class="opacity-60">${counts[t]}</span></button>`)}
+      </div>
+      <div class="mt-3 flex items-center justify-between text-xs text-[#86868b]">
+        <span>${rows.length}개의 카드${tag ? ` · #${tag}` : ""}</span>
+        <button onClick=${() => setGroup(!group)} class=${`rounded-full px-3 py-1 ${group ? "bg-[#0071e3] text-white" : "bg-white text-[#515154]"}`}>태그별로 묶어 보기</button>
+      </div>
+      ${group
+        ? html`${sections.length === 0 && html`<div class="mt-3 overflow-hidden rounded-2xl bg-white">${empty}</div>`}
+          ${sections.map(([name, list]) => html`<div key=${name} class="mt-4">
+            <div class="mb-1.5 px-1 text-[13px] font-semibold text-[#1d1d1f]">${name} <span class="font-normal text-[#86868b]">${list.length}</span></div>
+            <div class="overflow-hidden rounded-2xl bg-white">${list.map((m, i) => row(m, i, name + m.id))}</div>
+          </div>`)}`
+        : html`<div class="mt-3 overflow-hidden rounded-2xl bg-white">${rows.length === 0 ? empty : rows.map((m, i) => row(m, i, m.id))}</div>`}
+    </div>
+  </div>`;
+}
+
+/* ======================== 메모 상세 모달 ======================== */
+function MemoModal({ memo, state, dispatch, onClose, onDuplicate }) {
+  const [tagText, setTagText] = useState(memo.tags.join(", "));
+  const [confirmDel, setConfirmDel] = useState(false);
+  const patch = (p) => dispatch({ type: "updateMemo", id: memo.id, patch: p });
+  const commitTags = () => patch({ tags: tagText.split(",").map((t) => t.trim()).filter(Boolean) });
+  const close = () => { commitTags(); onClose(); };
+  useEffect(() => { const k = (e) => e.key === "Escape" && close(); window.addEventListener("keydown", k); return () => window.removeEventListener("keydown", k); });
+  const inMap = (id) => state.maps.find((m) => m.id === id).nodes.some((n) => n.memoId === memo.id);
+  const toggleMap = (id) => inMap(id) ? dispatch({ type: "unplace", mapId: id, memoId: memo.id }) : dispatch({ type: "place", mapId: id, memoId: memo.id, x: 60 + Math.random() * 120, y: 60 + Math.random() * 120 });
+  return html`
+  <div class="fixed inset-0 z-50 flex items-end justify-center sm:items-center" style="background:rgba(0,0,0,.3);backdrop-filter:blur(4px)" onClick=${close}>
+    <div class="flex max-h-[88vh] w-full flex-col rounded-t-3xl bg-white p-5 shadow-2xl sm:max-w-lg sm:rounded-3xl" style="padding-bottom:calc(env(safe-area-inset-bottom,0px) + 1.25rem)" onClick=${(e) => e.stopPropagation()}>
+      <div class="flex items-start gap-2">
+        <input value=${memo.title} onInput=${(e) => patch({ title: e.target.value })} placeholder="제목" class="min-w-0 flex-1 text-xl font-semibold text-[#1d1d1f] outline-none placeholder:text-[#c7c7cc]" />
+        <button onClick=${close} class="rounded-full bg-[#f5f5f7] p-1.5 text-[#6e6e73]" aria-label="닫기">${Ico("x", 16)}</button>
+      </div>
+      <textarea value=${memo.body} onInput=${(e) => patch({ body: e.target.value })} placeholder="내용을 입력하세요" class="mt-3 min-h-[180px] flex-1 resize-none text-[15px] leading-relaxed text-[#1d1d1f] outline-none placeholder:text-[#c7c7cc]"></textarea>
+      <input value=${tagText} onInput=${(e) => setTagText(e.target.value)} onBlur=${commitTags} placeholder="태그 (쉼표로 구분)" class="mt-3 rounded-lg bg-[#f5f5f7] px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-[#0071e3]/40" />
+      <div class="mt-4">
+        <div class="mb-1.5 text-xs text-[#86868b]">배치된 맵 (모든 맵에서 같은 카드를 공유합니다)</div>
+        <div class="flex flex-wrap gap-1.5">
+          ${state.maps.map((m) => html`<button key=${m.id} onClick=${() => toggleMap(m.id)} class=${`rounded-full px-3 py-1 text-xs ${inMap(m.id) ? "bg-[#0071e3] text-white" : "bg-[#f5f5f7] text-[#515154]"}`}>${m.name}</button>`)}
+        </div>
+      </div>
+      <div class="mt-5 flex items-center justify-between text-sm">
+        ${confirmDel
+          ? html`<button onClick=${() => { dispatch({ type: "deleteMemo", id: memo.id }); onClose(); }} class="flex items-center gap-1 font-medium text-[#d70015]">${Ico("trash", 14)}모든 맵에서 삭제</button>`
+          : html`<button onClick=${() => setConfirmDel(true)} class="flex items-center gap-1 text-[#d70015]">${Ico("trash", 14)}삭제</button>`}
+        <button onClick=${() => { commitTags(); onDuplicate(memo); }} class="text-[#0071e3]">복사본 만들기</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+/* ======================== AI용 텍스트 ======================== */
+function toMarkdown(state, only) {
+  const maps = only ? [only] : state.maps;
+  const ids = new Set(); maps.forEach((m) => m.nodes.forEach((n) => n.memoId && ids.add(n.memoId)));
+  const memos = only ? state.memos.filter((m) => ids.has(m.id)) : state.memos;
+  const no = {}; memos.forEach((m, i) => { no[m.id] = i + 1; });
+  const label = (m) => `[${no[m.id]}] ${m.title || "제목 없음"}`;
+  const L = [`# VibeArchiver 내용 정리 (${new Date().toISOString().slice(0, 10)})`, "", "카드는 [번호]로 참조합니다. 맵 구성의 화살표(→)는 사용자가 직접 이은 연결입니다.", "", `## 카드 (${memos.length}개)`, ""];
+  memos.forEach((m) => {
+    const inMaps = state.maps.filter((mp) => mp.nodes.some((n) => n.memoId === m.id)).map((mp) => mp.name);
+    L.push(`### ${label(m)}`);
+    if (m.tags.length) L.push(`- 태그: ${m.tags.join(", ")}`);
+    if (inMaps.length) L.push(`- 배치된 맵: ${inMaps.join(", ")}`);
+    L.push("", m.body.trim() || "(내용 없음)", "");
+  });
+  L.push("## 맵 구성", "");
+  maps.forEach((mp) => {
+    const nm = (n) => {
+      if (n.mapRef) return `맵 '${(state.maps.find((x) => x.id === n.mapRef) || {}).name}'`;
+      if (n.img) return "이미지";
+      const m = state.memos.find((x) => x.id === n.memoId); return m && no[m.id] ? label(m) : "카드";
+    };
+    const cards = mp.nodes.filter((n) => n.memoId).map(nm), mapsIn = mp.nodes.filter((n) => n.mapRef).map(nm), imgs = mp.nodes.filter((n) => n.img).length;
+    L.push(`### ${mp.name}${mp.home ? " (홈: 맵 전체 구성)" : ""}`);
+    if (mapsIn.length) L.push(`- 포함된 맵: ${mapsIn.join(", ")}`);
+    if (cards.length) L.push(`- 카드: ${cards.join(" / ")}`);
+    if (imgs) L.push(`- 이미지 ${imgs}개 (내용은 포함되지 않음)`);
+    if (mp.strokes.length) L.push(`- 손글씨 ${mp.strokes.length}개 (내용은 포함되지 않음)`);
+    mp.links.forEach((l) => { const a = mp.nodes.find((n) => n.id === l.from), b = mp.nodes.find((n) => n.id === l.to); if (a && b) L.push(`- 연결: ${nm(a)} → ${nm(b)}`); });
+    L.push("");
+  });
+  return L.join("\n");
+}
+
+/* ======================== 맵 → PNG ======================== */
+function wrapText(ctx, text, maxW, maxLines) {
+  const lines = [];
+  for (const para of String(text).split("\n")) {
+    let cur = "";
+    for (const ch of para) { if (ctx.measureText(cur + ch).width > maxW) { lines.push(cur); cur = ch; } else cur += ch; }
+    lines.push(cur);
+  }
+  if (lines.length > maxLines) { lines.length = maxLines; lines[maxLines - 1] += "…"; }
+  return lines;
+}
+async function drawMapPng(state, map) {
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  const ext = (x, y) => { x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y); };
+  map.nodes.forEach((n) => { const d = dims(n); ext(n.x, n.y); ext(n.x + d.w, n.y + d.h); });
+  map.strokes.forEach((s) => s.pts.forEach((p) => ext(p.x, p.y)));
+  if (x0 > x1) return null;
+  const pad = 48, w = x1 - x0 + pad * 2, hh = y1 - y0 + pad * 2, S = Math.min(2, 8000 / Math.max(w, hh));
+  const cv = document.createElement("canvas");
+  cv.width = Math.ceil(w * S); cv.height = Math.ceil(hh * S);
+  const ctx = cv.getContext("2d");
+  ctx.fillStyle = "#f5f5f7"; ctx.fillRect(0, 0, cv.width, cv.height);
+  ctx.setTransform(S, 0, 0, S, (pad - x0) * S, (pad - y0) * S);
+  const FONT = '-apple-system, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif';
+  const node = (id) => map.nodes.find((n) => n.id === id);
+  ctx.lineCap = "round"; ctx.lineJoin = "round";
+  const imgs = {};
+  await Promise.all(map.nodes.filter((n) => n.img).map((n) => new Promise((r) => { const im = new Image(); im.onload = () => { imgs[n.id] = im; r(); }; im.onerror = r; im.src = n.img; })));
+  map.links.forEach((l) => {
+    const f = node(l.from), t = node(l.to); if (!f || !t) return;
+    const df = dims(f), dt = dims(t), ax = f.x + df.w / 2, ay = f.y + df.h / 2, bx = t.x + dt.w / 2, by = t.y + dt.h / 2;
+    ctx.strokeStyle = "#86868b"; ctx.fillStyle = "#86868b"; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke();
+    const dx = bx - ax, dy = by - ay, k = Math.min(dt.w / 2 / (Math.abs(dx) || 1e-6), dt.h / 2 / (Math.abs(dy) || 1e-6));
+    const px = bx - dx * k, py = by - dy * k, ang = Math.atan2(dy, dx);
+    ctx.beginPath(); ctx.moveTo(px, py);
+    ctx.lineTo(px - 9 * Math.cos(ang - 0.4), py - 9 * Math.sin(ang - 0.4));
+    ctx.lineTo(px - 9 * Math.cos(ang + 0.4), py - 9 * Math.sin(ang + 0.4)); ctx.fill();
+  });
+  map.nodes.forEach((n) => {
+    const ci = cardInfo(state, n); if (!ci) return;
+    const d = dims(n);
+    ctx.save();
+    ctx.shadowColor = "rgba(0,0,0,.12)"; ctx.shadowBlur = 12; ctx.shadowOffsetY = 4; ctx.fillStyle = ci.compact ? ci.color : "#fff";
+    ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(n.x, n.y, d.w, d.h, 16); else ctx.rect(n.x, n.y, d.w, d.h);
+    ctx.fill(); ctx.restore();
+    if (ci.img) {
+      const im = imgs[n.id];
+      if (im) { ctx.save(); ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(n.x, n.y, d.w, d.h, 16); else ctx.rect(n.x, n.y, d.w, d.h); ctx.clip(); ctx.drawImage(im, n.x, n.y, d.w, d.h); ctx.restore(); }
+      return;
+    }
+    ctx.textBaseline = "top";
+    ctx.font = `600 13px ${FONT}`; ctx.fillStyle = ci.dark ? "#fff" : "#1d1d1f";
+    const tl = wrapText(ctx, ci.title, d.w - 28, 2), ty = ci.compact ? (d.h - tl.length * 18) / 2 : 14;
+    ctx.textAlign = ci.compact ? "center" : "left"; const tx = ci.compact ? n.x + d.w / 2 : n.x + 14; tl.forEach((s, i) => ctx.fillText(s, tx, n.y + ty + i * 18)); ctx.textAlign = "left";
+    ctx.font = `12px ${FONT}`; ctx.fillStyle = ci.dark ? "#a1a1a6" : "#6e6e73";
+    if (!ci.compact) wrapText(ctx, ci.body, CARD_W - 28, 3).forEach((s, i) => ctx.fillText(s, n.x + 14, n.y + 14 + tl.length * 18 + 4 + i * 17));
+  });
+  ctx.strokeStyle = "#1d1d1f"; ctx.lineWidth = 2.5;
+  map.strokes.forEach((s) => { ctx.beginPath(); s.pts.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y))); ctx.stroke(); });
+  return new Promise((res) => cv.toBlob(res, "image/png"));
+}
+
+/* ======================== App ======================== */
+function App() {
+  const [state, rawDispatch] = useReducer(reducer, null, () => migrate(lsLoad() || seed()));
+  const [ro, setRo] = useState(false);
+  const [force, setForce] = useState(0);
+  const lastWarn = useRef(0);
+  const dispatch = (a) => {
+    if (ro && a.type !== "load") { if (Date.now() - lastWarn.current > 2500) { lastWarn.current = Date.now(); say("보기 전용입니다. 수정하려면 소유자에게 편집 권한을 받아야 해요."); } return; }
+    rawDispatch(a);
+  };
+  const [mapId, setMapId] = useState("home");
+  const [hist, setHist] = useState([]);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [delId, setDelId] = useState(null);
+  const [editId, setEditId] = useState(null);
+  const [view, setView] = useState("canvas");
+  const [tool, setTool] = useState("move");
+  const [query, setQuery] = useState("");
+  const [tag, setTag] = useState("");
+  const [openId, setOpenId] = useState(null);
+  const [cams, setCams] = useState({});
+  const [renaming, setRenaming] = useState(null);
+  const [status, setStatus] = useState("connecting");
+  const [toast, setToast] = useState("");
+  const [cloudReady, setCloudReady] = useState(false);
+  const [menu, setMenu] = useState(false);
+  const docRef = useRef(null), dl = useRef(null), fileRef = useRef(null), assets = useRef(null), imgInput = useRef(null);
+  const skipSave = useRef(false), firstSnap = useRef(true), chain = useRef(Promise.resolve());
+
+  /* 클라우드 연결: 로그인한 claude.ai 계정의 비공개 저장소에 저장 → 같은 계정이면 어떤 기기에서든 이어짐 */
+  useEffect(() => {
+    let off = () => {}, dead = false;
+    (async () => {
+      try {
+        const c = window.claude;
+        const [db, user, d, ast] = c ? await Promise.all([c.use("db"), c.use("user"), c.use("downloads"), c.use("assets")]) : [null, null, null, null];
+        dl.current = d || { save: async ({ filename, data }) => { const b = data instanceof Blob ? data : new Blob([data]); const u = URL.createObjectURL(b); const a = Object.assign(document.createElement("a"), { href: u, download: filename }); document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(u), 1500); } };
+        assets.current = ast;
+        const id = db && user ? await user.id() : null;
+        if (dead) return;
+        if (!id) { setStatus("local"); setCloudReady(true); return; }
+        docRef.current = db.doc("archive/main");
+        const personal = db.doc(`data/users/${id}/main`);
+        let editor = true; try { if (user.can("data.write") === false) editor = false; } catch {}
+        setRo(!editor);
+        off = docRef.current.onSnapshot((snap) => {
+          const first = firstSnap.current; firstSnap.current = false;
+          const v = snap.exists ? snap.data() : null;
+          if (v && v.json && (first || v.by !== CID)) {
+            try { const data = JSON.parse(v.json); if (Array.isArray(data.memos) && Array.isArray(data.maps) && data.maps.length) { skipSave.current = true; rawDispatch({ type: "load", data }); } } catch {}
+          }
+          if (first) {
+            if (!v && editor) {
+              personal.get().then((ps) => {
+                let data = null; const pv = ps.exists ? ps.data() : null;
+                try { data = pv && pv.json ? JSON.parse(pv.json) : null; } catch {}
+                if (data && Array.isArray(data.memos) && Array.isArray(data.maps) && data.maps.length) rawDispatch({ type: "load", data });
+                else setForce((f) => f + 1);
+              }).catch(() => setForce((f) => f + 1));
+            }
+            setCloudReady(true); setStatus(editor ? "cloud" : "view");
+          }
+        }, () => { setStatus("local"); setCloudReady(true); });
+      } catch { setStatus("local"); setCloudReady(true); }
+    })();
+    return () => { dead = true; off(); };
+  }, []);
+
+  /* 변경 시 저장: LocalStorage는 항상, 클라우드는 잠깐 멈췄을 때 한 번에 */
+  useEffect(() => {
+    if (!cloudReady) return;
+    lsSave(state);
+    if (skipSave.current) { skipSave.current = false; return; }
+    if (!docRef.current || ro) return;
+    setStatus("saving");
+    const t = setTimeout(() => {
+      chain.current = chain.current.then(() => docRef.current.set({ json: JSON.stringify(state), by: CID, t: Date.now() }))
+        .then(() => setStatus("cloud")).catch(() => setStatus("error"));
+    }, 900);
+    return () => clearTimeout(t);
+  }, [state, cloudReady, force]);
+
+  const say = (m) => { setToast(m); setTimeout(() => setToast(""), 3000); };
+  const map = state.maps.find((m) => m.id === mapId) || state.maps[0];
+  const cam = cams[map.id] || DEF_CAM;
+  const setCam = useCallback((fn) => setCams((c) => ({ ...c, [map.id]: fn(c[map.id] || DEF_CAM) })), [map.id]);
+  const viewCenter = () => ({ x: (window.innerWidth / 2 - cam.x) / cam.k - CARD_W / 2, y: (window.innerHeight / 2 - cam.y) / cam.k - CARD_H / 2 });
+
+  const closeEdit = () => { const m = state.maps.find((x) => x.id === editId); if (m && !m.name.trim()) dispatch({ type: "renameMap", id: m.id, name: "이름 없는 맵" }); setEditId(null); };
+  const deleteMap = () => { const id = delId; setDelId(null); dispatch({ type: "delMap", id }); setHist((h) => h.filter((x) => x !== id)); if (map.id === id) setMapId("home"); };
+  const go = (id) => { setView("canvas"); if (id === map.id) return; setHist((h) => [...h, map.id]); setMapId(id); };
+  const back = () => { setView("canvas"); if (hist.length) { setMapId(hist[hist.length - 1]); setHist(hist.slice(0, -1)); } else setMapId("home"); };
+  const newCard = () => {
+    const c = viewCenter(), j = () => (Math.random() - 0.5) * 40;
+    const memo = { id: uid(), title: "", body: "", tags: [], updated: Date.now() };
+    dispatch({ type: "addMemo", memo, mapId: map.id, x: c.x + j(), y: c.y + j() });
+    setOpenId(memo.id);
+  };
+  const duplicate = (m) => {
+    const copy = { ...m, id: uid(), title: (m.title || "제목 없음") + " (복사)", updated: Date.now() }, c = viewCenter();
+    dispatch({ type: "addMemo", memo: copy, mapId: map.id, x: c.x + 30, y: c.y + 30 });
+    setOpenId(copy.id);
+  };
+  const addToCurrent = (memoId) => { const c = viewCenter(); dispatch({ type: "place", mapId: map.id, memoId, x: c.x, y: c.y }); };
+  const addMap = () => { const id = uid(); dispatch({ type: "addMap", id, name: `새 맵 ${state.maps.length + 1}` }); go(id); setRenaming(id); };
+  const commitRename = (id, v) => { if (v.trim()) dispatch({ type: "renameMap", id, name: v.trim() }); setRenaming(null); };
+
+  const onPickImage = async (e) => {
+    const f = e.target.files && e.target.files[0]; e.target.value = ""; if (!f) return;
+    try {
+      say("이미지를 올리는 중…");
+      const up = !!assets.current;
+      const { blob, r } = await shrink(f, up ? 1600 : 640, up ? 0.85 : 0.6);
+      let src;
+      if (up) { const a = await assets.current.upload(blob); src = "/_blob/" + a.id; }
+      else src = await new Promise((res) => { const fr = new FileReader(); fr.onload = () => res(fr.result); fr.readAsDataURL(blob); });
+      const c = viewCenter();
+      dispatch({ type: "addImage", mapId: map.id, img: src, w: 240, r, x: c.x, y: c.y });
+      say(up ? "이미지를 추가했습니다." : "이미지를 추가했습니다. (이 환경에서는 작은 크기로 저장됩니다)");
+    } catch { say("이미지를 추가하지 못했습니다. 다른 파일로 다시 시도해 주세요."); }
+  };
+  const exportFile = async (kind) => {
+    setMenu(false);
+    const base = map.name.replace(/[\\/:*?"<>|]/g, "_"), day = new Date().toISOString().slice(0, 10);
+    try {
+      if (kind === "aiFile" || kind === "aiCopy") {
+        const md = toMarkdown(state, map.home ? null : map);
+        if (kind === "aiCopy") { try { await navigator.clipboard.writeText(md); say("복사했습니다. AI 채팅에 붙여 넣으세요."); } catch { say("복사하지 못했어요. 파일로 받아 주세요."); } }
+        else await dl.current.save({ filename: `${base}-AI용.md`, data: md });
+      } else if (kind === "png") {
+        const blob = await drawMapPng(state, map);
+        if (!blob) return say("이 맵은 비어 있어서 이미지로 만들 수 없습니다.");
+        await dl.current.save({ filename: `${base}.png`, data: blob });
+      } else if (kind === "map") {
+        const ids = new Set(map.nodes.map((n) => n.memoId));
+        await dl.current.save({ filename: `${base}.json`, data: JSON.stringify({ single: true, memos: state.memos.filter((m) => ids.has(m.id)), maps: [map] }, null, 2) });
+      } else await dl.current.save({ filename: `vibearchiver-전체-${day}.json`, data: JSON.stringify(state, null, 2) });
+    } catch { say("내보내기를 취소했거나 저장하지 못했습니다."); }
+  };
+  const importJson = async (e) => {
+    const f = e.target.files && e.target.files[0]; e.target.value = ""; if (!f) return;
+    try {
+      const d = JSON.parse(await f.text());
+      if (!Array.isArray(d.memos) || !Array.isArray(d.maps) || !d.maps.length) throw new Error();
+      if (d.single) { dispatch({ type: "merge", memos: d.memos, maps: d.maps }); say("맵을 추가했습니다."); }
+      else { dispatch({ type: "load", data: d }); setMapId("home"); setHist([]); say("전체 데이터를 가져왔습니다."); }
+    } catch { say("가져올 수 없는 파일입니다. VibeArchiver에서 내보낸 JSON을 선택해 주세요."); }
+  };
+
+  const openMemo = state.memos.find((m) => m.id === openId);
+  const sq = query.trim().toLowerCase();
+  const matchCount = sq ? map.nodes.filter((n) => matchCI(cardInfo(state, n), sq)).length : 0;
+  const home = state.maps.find((m) => m.home);
+  const linked = home ? home.links.map((l) => { const a = home.nodes.find((n) => n.id === l.from), b = home.nodes.find((n) => n.id === l.to); if (!a || !b) return null; const o = a.mapRef === map.id ? b : b.mapRef === map.id ? a : null; return o && state.maps.find((m) => m.id === o.mapRef); }).filter(Boolean) : [];
+  const hint = view !== "canvas" ? "" : tool === "link" ? (map.home ? "맵 두 개를 차례로 탭하면 선으로 연결돼요" : "카드나 이미지 두 개를 차례로 탭하면 선으로 연결돼요") : tool === "erase" ? (map.home ? "지울 선을 탭하거나, 맵 카드를 탭해 맵을 삭제하세요" : "지울 선이나 이미지를 탭하세요") : tool === "pen" ? "손가락이나 펜으로 그려 보세요" : map.home && tool === "move" ? "맵을 길게 누르면 이름과 색을 바꿀 수 있어요" : "";
+  const tools = [["move", "선택·이동"], ["pen", "펜"], ["link", "카드 연결"], ["erase", "선 지우기"]];
+  const stText = { connecting: "연결 중…", cloud: "저장됨 · 공유 저장소", view: "보기 전용 (편집 권한 없음)", saving: "저장 중…", local: "이 기기에만 저장", error: "저장 실패 · 이 기기에는 저장됨" }[status];
+
+  return html`
+  <div class="fixed inset-0 text-[#1d1d1f] antialiased" style="background:#f5f5f7;font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Apple SD Gothic Neo','Pretendard',sans-serif">
+    ${view === "canvas"
+      ? html`<${Canvas} key=${map.id} state=${state} dispatch=${dispatch} map=${map} tool=${tool} cam=${cam} setCam=${setCam} openMemo=${setOpenId} openMap=${go} query=${searchOpen ? query : ""} askDelete=${setDelId} editMap=${setEditId} />`
+      : html`<${ListView} state=${state} query=${query} setQuery=${setQuery} tag=${tag} setTag=${setTag} openMemo=${setOpenId} mapId=${map.id} addToCurrent=${addToCurrent} />`}
+
+    <header class="absolute inset-x-0 top-0 z-20 flex items-center gap-2 border-b border-black/5 px-3 pb-2" style="padding-top:calc(env(safe-area-inset-top,0px) + 8px);background:rgba(255,255,255,.72);backdrop-filter:blur(20px)">
+      ${(!map.home || hist.length > 0) && html`<button onClick=${back} class="rounded-full p-1.5 text-[#1d1d1f]" aria-label="뒤로 가기" title="뒤로 가기">${Ico("back", 18)}</button>`}
+      <div class="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
+        ${state.maps.map((m) => renaming === m.id
+          ? html`<input key=${m.id} ref=${(el) => el && el.focus()} value=${m.name} class="w-28 rounded-full bg-white px-3 py-1 text-[13px] outline-none ring-2 ring-[#0071e3]/40" onBlur=${(e) => commitRename(m.id, e.target.value)} onKeyDown=${(e) => e.key === "Enter" && e.target.blur()} />`
+          : html`<button key=${m.id} onClick=${() => go(m.id)} onDblClick=${() => !m.home && setRenaming(m.id)} class=${`whitespace-nowrap rounded-full px-3 py-1 text-[13px] ${m.id === map.id ? "bg-[#1d1d1f] text-white" : "text-[#515154]"}`}>${m.name}</button>`)}
+        <button onClick=${addMap} class="rounded-full p-1.5 text-[#86868b]" aria-label="새 맵">${Ico("plus", 15)}</button>
+      </div>
+      <div class="flex rounded-lg bg-black/5 p-0.5 text-[13px]">
+        ${[["canvas", "캔버스"], ["list", "목록"]].map(([k, l]) => html`<button key=${k} onClick=${() => setView(k)} class=${`rounded-md px-3 py-1 ${view === k ? "bg-white shadow-sm" : "text-[#6e6e73]"}`}>${l}</button>`)}
+      </div>
+      ${!map.home && html`<button onClick=${() => setDelId(map.id)} class="rounded-full p-1.5 text-[#6e6e73]" title="이 맵 삭제" aria-label="이 맵 삭제">${Ico("trash", 16)}</button>`}
+      ${dl.current && html`<div class="relative">
+        <button onClick=${() => setMenu(!menu)} class="rounded-full p-1.5 text-[#6e6e73]" title="내려받기">${Ico("down", 16)}</button>
+        ${menu && html`<div class="absolute right-0 top-9 z-30 w-64 rounded-xl bg-white p-1 text-[13px] text-[#1d1d1f]" style="box-shadow:0 8px 30px rgba(0,0,0,.18)">
+          <button onClick=${() => exportFile("png")} class="block w-full rounded-lg px-3 py-2 text-left active:bg-[#f5f5f7]">현재 맵을 이미지로 (PNG)</button>
+          ${!map.home && html`<button onClick=${() => exportFile("map")} class="block w-full rounded-lg px-3 py-2 text-left active:bg-[#f5f5f7]">현재 맵을 파일로 (JSON)</button>`}
+          <button onClick=${() => exportFile("all")} class="block w-full rounded-lg px-3 py-2 text-left active:bg-[#f5f5f7]">전체 백업 (JSON)</button>
+          <div class="my-1 h-px bg-black/5"></div>
+          <div class="flex items-center justify-between rounded-lg px-3 py-2"><span>AI용 텍스트 (${map.home ? "전체" : "현재 맵"})</span><span class="flex gap-3 text-[#0071e3]"><button onClick=${() => exportFile("aiCopy")}>복사</button><button onClick=${() => exportFile("aiFile")}>파일</button></span></div>
+        </div>`}
+      </div>`}
+      <button onClick=${() => fileRef.current && fileRef.current.click()} class="rounded-full p-1.5 text-[#6e6e73]" title="JSON 가져오기">${Ico("up", 16)}</button>
+      <input ref=${fileRef} type="file" accept="application/json" class="hidden" onChange=${importJson} />
+    </header>
+    <div class="absolute right-3 z-10 text-[11px] text-[#86868b]" style="top:calc(env(safe-area-inset-top,0px) + 52px)">${stText}</div>
+
+    <div class="absolute left-1/2 z-20 flex items-center gap-1 rounded-full p-1.5" style="bottom:calc(env(safe-area-inset-bottom,0px) + 20px);transform:translateX(-50%);background:rgba(255,255,255,.82);backdrop-filter:blur(20px);border:1px solid rgba(0,0,0,.05);box-shadow:0 8px 30px rgba(0,0,0,.12)">
+      ${view === "canvas" && html`
+        ${tools.map(([k, label]) => html`<button key=${k} onClick=${() => setTool(k)} title=${label} aria-label=${label} class=${`rounded-full p-2.5 ${tool === k ? "bg-[#1d1d1f] text-white" : "text-[#515154]"}`}>${Ico(k)}</button>`)}
+        <div class="mx-1 h-5 w-px bg-black/10"></div>
+        <button onClick=${() => setCam(() => DEF_CAM)} class="px-2 text-xs text-[#6e6e73]" style="font-variant-numeric:tabular-nums" title="화면 초기화">${Math.round(cam.k * 100)}%</button>`}
+      ${view === "canvas" && html`<button onClick=${() => { if (searchOpen) setQuery(""); setSearchOpen(!searchOpen); }} class=${`rounded-full p-2.5 ${searchOpen ? "bg-[#1d1d1f] text-white" : "text-[#515154]"}`} title="단어 검색" aria-label="단어 검색">${Ico("search")}</button>`}
+      ${view === "canvas" && html`<button onClick=${() => imgInput.current && imgInput.current.click()} class="rounded-full p-2.5 text-[#515154]" title="이미지 추가" aria-label="이미지 추가">${Ico("image")}</button>`}
+      <input ref=${imgInput} type="file" accept="image/*" class="hidden" onChange=${onPickImage} />
+      <button onClick=${newCard} class="rounded-full bg-[#0071e3] p-2.5 text-white" title="새 카드" aria-label="새 카드">${Ico("plus")}</button>
+    </div>
+
+    ${view === "canvas" && !map.home && linked.length > 0 && html`<div class="absolute left-3 z-10 flex flex-wrap gap-1.5" style="max-width:60%;top:calc(env(safe-area-inset-top,0px) + 52px)">${linked.map((m) => html`<button key=${m.id} onClick=${() => go(m.id)} class="rounded-full px-3 py-1 text-xs text-[#0071e3]" style="background:rgba(255,255,255,.85);backdrop-filter:blur(10px)">${m.name} ›</button>`)}</div>`}
+    ${view === "canvas" && searchOpen && html`<div class="absolute left-1/2 z-20 flex items-center gap-2 rounded-full px-4 py-2" style="top:calc(env(safe-area-inset-top,0px) + 88px);transform:translateX(-50%);background:rgba(255,255,255,.95);box-shadow:0 4px 16px rgba(0,0,0,.12)">
+      <input autofocus value=${query} onInput=${(e) => setQuery(e.target.value)} placeholder="이 맵에서 단어 찾기" class="w-44 bg-transparent text-sm outline-none" />
+      <span class="whitespace-nowrap text-xs text-[#86868b]">${sq ? `${matchCount}개` : ""}</span>
+    </div>`}
+    ${editId && (() => { const m = state.maps.find((x) => x.id === editId); if (!m) return null; return html`<div class="fixed inset-0 z-[70] flex items-end justify-center sm:items-center" style="background:rgba(0,0,0,.3);backdrop-filter:blur(4px)" onClick=${closeEdit}>
+      <div class="w-full rounded-t-3xl bg-white p-5 sm:max-w-sm sm:rounded-3xl" style="padding-bottom:calc(env(safe-area-inset-bottom,0px) + 1.25rem)" onClick=${(e) => e.stopPropagation()}>
+        <input value=${m.name} onInput=${(e) => dispatch({ type: "renameMap", id: m.id, name: e.target.value })} placeholder="맵 이름" class="w-full text-lg font-semibold outline-none" />
+        <div class="mt-4 flex gap-3">${COLORS.map((c) => html`<button key=${c} onClick=${() => dispatch({ type: "setColor", id: m.id, color: c })} aria-label=${c} class="h-8 w-8 rounded-full" style=${`background:${c};box-shadow:${(m.color || COLORS[0]) === c ? "0 0 0 2px #fff,0 0 0 4px " + c : "none"}`}></button>`)}</div>
+        <div class="mt-5 flex items-center justify-between text-sm">
+          <button onClick=${() => { setEditId(null); setDelId(m.id); }} class="text-[#d70015]">맵 삭제</button>
+          <button onClick=${closeEdit} class="rounded-full bg-[#1d1d1f] px-4 py-1.5 text-white">완료</button>
+        </div>
+      </div>
+    </div>`; })()}
+    ${delId && html`<div class="fixed inset-0 z-[70] flex items-center justify-center p-6" style="background:rgba(0,0,0,.3);backdrop-filter:blur(4px)" onClick=${() => setDelId(null)}>
+      <div class="w-full max-w-xs rounded-2xl bg-white p-5 text-center" onClick=${(e) => e.stopPropagation()}>
+        <div class="text-[15px] font-semibold">'${(state.maps.find((m) => m.id === delId) || {}).name}' 맵을 삭제할까요?</div>
+        <div class="mt-1 text-[13px] leading-snug text-[#6e6e73]">맵 위의 배치, 연결선, 손글씨, 이미지가 사라집니다. 메모 카드는 목록에 그대로 남아요.</div>
+        <div class="mt-4 flex gap-2">
+          <button onClick=${() => setDelId(null)} class="flex-1 rounded-xl bg-[#f5f5f7] py-2 text-sm">취소</button>
+          <button onClick=${deleteMap} class="flex-1 rounded-xl bg-[#d70015] py-2 text-sm text-white">삭제</button>
+        </div>
+      </div>
+    </div>`}
+    ${hint && html`<div class="absolute left-1/2 z-10 whitespace-nowrap rounded-full px-3 py-1 text-xs text-white" style="bottom:calc(env(safe-area-inset-bottom,0px) + 76px);transform:translateX(-50%);background:rgba(29,29,31,.82)">${hint}</div>`}
+    ${toast && html`<div class="fixed left-1/2 top-24 z-[60] max-w-[90vw] -translate-x-1/2 rounded-full bg-[#1d1d1f] px-4 py-2 text-sm text-white">${toast}</div>`}
+    ${openMemo && html`<${MemoModal} key=${openMemo.id} memo=${openMemo} state=${state} dispatch=${dispatch} onClose=${() => setOpenId(null)} onDuplicate=${duplicate} />`}
+  </div>`;
+}
+
+render(html`<${App} />`, document.getElementById("root"));
+</script>
+</body>
+</html>
